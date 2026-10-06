@@ -19,8 +19,11 @@ import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.g1_policy as g1_policy
 import openpi.policies.libero_policy as libero_policy
+# import openpi.policies.simpk_policy as simpk_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -65,6 +68,17 @@ class AssetsConfig:
 class DataConfig:
     # LeRobot repo id. If None, fake data will be created.
     repo_id: str | None = None
+    # Directory holding the LeRobot dataset itself. When set, the dataset is read straight
+    # from this path and `repo_id` is used only as a label (for the assets/norm-stats
+    # directory). When None, LeRobot resolves the dataset as $HF_LEROBOT_HOME/<repo_id> and
+    # falls back to downloading it from the Hub.
+    local_root: str | None = None
+    # LeRobot video decoding backend ("pyav", "torchcodec", "video_reader"); None lets
+    # LeRobot choose. "torchcodec" measured ~1.6x faster than "pyav" on the G1 data
+    # (36 vs 59 ms/sample) but needs the FFmpeg shared libraries, which the Dockerfile now
+    # installs. "pyav" bundles its own libav, so it is the fallback for a runtime without
+    # ffmpeg -- without it torchcodec raises on the first frame decode.
+    video_backend: str | None = None
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
@@ -356,6 +370,100 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotSimpkDataConfig(DataConfigFactory):
+    """Data config for the simpk/single_pickplace bimanual pick-and-place dataset."""
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "image",
+                        "observation/left_wrist_image": "left_wrist_image",
+                        "observation/right_wrist_image": "right_wrist_image",
+                        "observation/state": "state",
+                        "actions": "actions",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[simpk_policy.SimpkInputs()],
+            outputs=[simpk_policy.SimpkOutputs()],
+        )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+@dataclasses.dataclass(frozen=True)
+class LeRobotG1DataConfig(DataConfigFactory):
+    """Data config for Unitree G1 upper-body LeRobot dataset."""
+
+    default_prompt: str | None = None
+
+    # Maps the LeRobot dataset feature names onto the keys that `g1_policy.G1Inputs`
+    # consumes (which are also the keys a policy client must send at inference time).
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.ego_view",
+                        "observation/left_wrist_image": "observation.images.ego_left",
+                        "observation/right_wrist_image": "observation.images.ego_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[g1_policy.G1Inputs()],
+            outputs=[g1_policy.G1Outputs()],
+        )
+
+        # Action dims are [L_arm 7, L_hand 7, R_arm 7, R_hand 7]. Arms are trained as
+        # deltas from the current joint position -- easier to predict than an absolute
+        # angle, and it turns the near-idle left arm into a ~0 target instead of a pose
+        # the policy would have to memorise. Hands stay absolute: they hold open or closed
+        # for long stretches, and near-zero deltas accumulate integration error that drifts
+        # the grip open across a 50-step chunk.
+        delta_action_mask = _transforms.make_bool_mask(7, -7, 7, -7)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt
+        )(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+@dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
     """
     Config for training on DROID, using RLDS data format (for efficient training on larger datasets).
@@ -462,6 +570,7 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -495,15 +604,23 @@ class TrainConfig:
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
+    # Held-out data used to compute validation loss. If None, validation is skipped.
+    val_data: DataConfigFactory | None = None
+    # How often (in steps) to compute validation loss.
+    val_interval: int = 166
+    # Number of batches to average over each time validation loss is computed.
+    val_num_batches: int = 10
+
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "./checkpoints"
-
+    checkpoint_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/unfrozen_vlm" ## Added by Rajat
+    archive_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/unfrozen_vlm" ## Added by Rajat
+    # checkpoint_dir: str = "./checkpoints/rajat"
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
+    batch_size: int = 64
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -511,11 +628,32 @@ class TrainConfig:
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
-    log_interval: int = 100
+    log_interval: int = 50
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 166
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Rolling window of how many of the most recent checkpoints to keep on disk (on top of
+    # anything pinned by keep_period). Raise this once more disk is free; each save is
+    # ~12.5 GiB with save_train_state=False, ~50 GiB with it True.
+    max_to_keep: int = 100
+
+    # Write the optimizer state alongside params. Orbax materialises everything it saves in
+    # host RAM first, so this is the difference between a 50 GiB and a 12.5 GiB save:
+    #   True  -> params 12.5 + train_state (params + Adam mu + nu) 37.5 = 50 GiB
+    #   False -> params 12.5 GiB only
+    # 50 GiB does not fit beside training on a 62 GiB host; it was OOM-killed at every save.
+    # False means --resume cannot continue a run (a crash restarts from step 0), but `params`
+    # is all serve_policy.py and the robot need.
+    save_train_state: bool = False
+
+    # Save checkpoints asynchronously (training continues while the write happens).
+    # Async holds the entire TrainState -- params + Adam mu + Adam nu + ema_params, i.e. 4x
+    # the parameter bytes -- in host RAM for the duration of the write. That is ~50 GiB for
+    # pi0.5, which the kernel OOM-killed at the first save on this 62 GiB host. Set False to
+    # stream the save to disk instead: each save blocks training for a few minutes, but peak
+    # host RAM stays near the steady-state footprint.
+    async_checkpointing: bool = False
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -545,6 +683,13 @@ class TrainConfig:
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+
+    @property
+    def archive_dir(self) -> pathlib.Path:
+        """Get the archive directory for this config."""
+        if not self.exp_name:
+            raise ValueError("--exp_name must be set")
+        return (pathlib.Path(self.archive_base_dir) / self.name / self.exp_name).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -742,9 +887,9 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi05_libero",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, discrete_state_input=False),
         data=LeRobotLiberoDataConfig(
-            repo_id="physical-intelligence/libero",
+            repo_id="rahul-ai-01/pi_data_50",
             base_config=DataConfig(prompt_from_task=True),
             extra_delta_transform=False,
         ),
@@ -759,6 +904,18 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    # Serves the locally-trained simpk/single_pickplace pi05 checkpoint.
+    # Architecture (pi05, gemma_2b + gemma_300m, action_dim=32) was read off the checkpoint
+    # params; action_horizon=50 and the three-camera layout come from the training run.
+    TrainConfig(
+        name="pi05_simpk",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotSimpkDataConfig(
+            repo_id="simpk/single_pickplace",
+            base_config=DataConfig(prompt_from_task=True),
+        ),
         num_train_steps=30_000,
     ),
     #
@@ -965,6 +1122,272 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+
+    # Fine-tunes pi05_base on the Unitree G1 upper-body teleop dataset.
+    #
+    # The dataset directory is given by `local_root`; `repo_id` is only a label, and names
+    # the assets/norm-stats directory. Do not put the path in `repo_id` -- LeRobot treats
+    # that as a Hub repo id and either fails validation or queries huggingface.co.
+    #
+    # The dataset must be in LeRobot v2.1 format -- the pinned LeRobot cannot read the
+    # v3.0 layout that the recording tooling produces. Convert it first with
+    # scripts/convert_lerobot_v30_to_v21.py.
+    TrainConfig(
+        name="pi05_g1",
+        # action_dim stays at pi0.5's native 32 even though G1 only has 28 real
+        # dimensions -- the pi05_base checkpoint's projections are 32-wide, and
+        # `PadStatesAndActions` pads the 28-dim data up to 32. Setting action_dim=28
+        # here silently loads mis-shaped weights out of the base checkpoint.
+        #
+        # discrete_state_input is deliberately NOT set: it must stay at the pi05 default
+        # of True. With pi05=True the model never builds `state_proj` (pi0.py:97 is in the
+        # `else` branch) and embed_suffix skips the continuous state token (pi0.py:151), so
+        # the discretised state string in the prompt is pi0.5's *only* proprioception path.
+        # Setting it False leaves the policy completely blind to joint state.
+        #
+        # max_token_len is likewise left unset -> 200 for pi05. The pi0 default of 48
+        # truncates the state string mid-sequence and drops the right arm entirely.
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotG1DataConfig(
+            repo_id="pi_data_50_v21",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/app/upper_body_data_v1",
+                video_backend="torchcodec",
+            ),
+        ),
+        batch_size=32,
+        # Each sample decodes 3 video frames (~36 ms), so the default of 2 workers cannot
+        # keep the GPU fed. 4 workers give 32*36/4 = 288 ms per batch of 32, still far under
+        # the 3.52 s/step compute time, so this is not the bottleneck. Kept at 4 rather than
+        # 8 because each worker holds decoded-frame buffers in shared memory (8 workers held
+        # 4.35 GiB at the OOM), and host RAM is the binding constraint on this 62 GiB box.
+        num_workers=2,
+        # Stream checkpoints to disk instead of snapshotting 50 GiB of TrainState into host
+        # RAM. See TrainConfig.async_checkpointing -- async saving OOM-killed the first run
+        # at step 2500.
+        async_checkpointing=False,
+        # 12.5 GiB saves instead of 50 GiB -- the only way this fits in 62 GiB of host RAM
+        # without swap. Trade-off: no --resume. See TrainConfig.save_train_state.
+        save_train_state=False,
+        # Spec value: write a checkpoint every 1000 steps -> 20 saves over the run.
+        # Sync saves cost ~3 min each (12.5 GiB streamed to disk), so 20 x 3 min = ~1 h of
+        # the ~20 h run spent checkpointing, which is acceptable. Anything much smaller
+        # (the previous 50) spends more wall-clock writing than training.
+        save_interval=1000,
+        # Constant 5e-5 after 1k warmup: decay_lr == peak_lr makes the cosine leg flat.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        # openpi hardcodes max_to_keep=1, so only the newest save plus every step where
+        # step % keep_period == 0 survives. With save_train_state=False a checkpoint is
+        # ~11.7 GiB (measured), so retaining all 20 saves would need 234 GiB and only
+        # ~115 GiB is free on /mnt/drive2. keep_period=5000 pins 5000/10000/15000/20000:
+        #   4 x 11.7 = 47 GiB kept, ~59 GiB peak during a write. Saves at the other 1000-step
+        # marks still happen -- they are just rotated out once the next one lands.
+        keep_period=5000,
+        wandb_enabled=False,
+    ),
+    # Single-GPU variant of pi05_g1. A full pi0.5 fine-tune needs >70GB of device memory;
+    # LoRA brings that to roughly 25GB, which is what fits on one card. EMA is off, as it
+    # is for every other LoRA config here.
+    TrainConfig(
+        name="pi05_g1_lora",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotG1DataConfig(
+            repo_id="pi_data_50_v21",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/app/pi_data_50_v21",
+                video_backend="torchcodec",
+            ),
+            # Point at pi05_g1's assets directory so `compute_norm_stats.py --config-name
+            # pi05_g1` only has to run once and both configs share identical statistics.
+            # (assets_dirs is otherwise derived from the config *name*, so LoRA would
+            # look for its own copy under ./assets/pi05_g1_lora/.)
+            assets=AssetsConfig(assets_dir="./assets/pi05_g1", asset_id="pi_data_50_v21"),
+        ),
+        batch_size=16,
+        # Each sample decodes 3 video frames (~36 ms), so the default of 2 workers cannot
+        # keep the GPU fed. 4 workers give 32*36/4 = 288 ms per batch of 32, still far under
+        # the 3.52 s/step compute time, so this is not the bottleneck. Kept at 4 rather than
+        # 8 because each worker holds decoded-frame buffers in shared memory (8 workers held
+        # 4.35 GiB at the OOM), and host RAM is the binding constraint on this 62 GiB box.
+        num_workers=2,
+        # Stream checkpoints to disk instead of snapshotting 50 GiB of TrainState into host
+        # RAM. See TrainConfig.async_checkpointing -- async saving OOM-killed the first run
+        # at step 2500.
+        async_checkpointing=False,
+        # 12.5 GiB saves instead of 50 GiB -- the only way this fits in 62 GiB of host RAM
+        # without swap. Trade-off: no --resume. See TrainConfig.save_train_state.
+        save_train_state=False,
+        # Spec value. Also keeps sync-save overhead sane: 12 saves x ~3 min instead of the
+        # 30 that the global default of 1000 would cause. 15000 is a multiple of it, so a
+        # save actually lands on the pinned step.
+        save_interval=500,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=20_000,
+    ),
+
+    # Fine-tunes pi05_base on the pick-and-place G1 dataset under ./train, with ./val held
+    # out for validation loss. Both are LeRobot v2.1 datasets with the same 28-dim
+    # observation.state/action layout as pi05_g1 above, so this reuses LeRobotG1DataConfig
+    # and g1_policy rather than a separate dex3 policy.
+    TrainConfig(
+        name="pi05_g1_pickplace",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,        # 28 real upper-body dims + 4 padding, matches pi05_base.
+            action_horizon=50,    # 2.5 s at this dataset's 20 fps.
+            # discrete_state_input stays at the pi05 default of True: with pi05=True the
+            # model never builds a continuous state token (see pi05_g1's comment above), so
+            # the discretised state string in the prompt is the only proprioception path.
+            # max_token_len is left unset (-> 200) so that string isn't truncated.
+        ),
+        data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/app/train",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/pi05_g1_pickplace/train/norm_stats.json",
+            ),
+        ),
+        val_data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace_val",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/app/val",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/pi05_g1_pickplace/train/norm_stats.json",
+            ),
+            # Reuse the train split's norm stats -- there's no separate norm_stats asset
+            # computed for val, and stats should come from the training distribution anyway.
+            assets=AssetsConfig(asset_id="g1_pickplace"),
+        ),
+        val_interval=166,
+        val_num_batches=42,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            # Warm up over ~1 epoch (166 steps) instead of 6 epochs
+            warmup_steps=166,
+            peak_lr=5e-5,       # Standard starting point for fine-tuning openpi/robotics tasks
+            decay_steps=5_000,   # Matches your total steps for a clean decay curve
+            decay_lr=1e-6,       # Let it decay to a minimum value to stabilize training at the end
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        wandb_enabled=False,  # No W&B account -- TensorBoard (checkpoint_dir/tensorboard) is
+                              # the monitoring path here; every logged scalar also goes to stdout.
+        num_train_steps=5_000,
+        batch_size=32,
+        num_workers=2,
+        # Same OOM history as pi05_g1 on this host (62 GiB RAM): async + full train-state
+        # saves (params + Adam mu/nu + ema) OOM-killed that run at step 2500. Stream
+        # params-only checkpoints to disk instead -- trades away `--resume`.
+        async_checkpointing=False,
+        save_train_state=False,
+        # /mnt/drive2 has ~277 GiB free (checked 2026-09-27). Each save is ~12.5 GiB
+        # (save_train_state=False), so a rolling window of the 10 most recent checkpoints
+        # is ~125 GiB steady, ~137.5 GiB peak while rotating -- comfortably inside budget.
+        # No pinned checkpoints (keep_period=None): a plain rolling window of 10 is what's
+        # wanted here, not specific pinned steps.
+        save_interval=50,
+        keep_period=None,
+        max_to_keep=100,
+        log_interval=50,
+        seed=0,
+    ),
+
+    # GR00T-matched comparison run: trains only the action expert + projections, freezes the
+    # PaliGemma language model AND the vision tower. get_freeze_filter() only freezes
+    # `.*llm.*`, which would leave the SigLIP vision tower trainable, so this uses an explicit
+    # filter that covers both `llm` and `img` while excluding the action expert (`llm_1`).
+    TrainConfig(
+        name="pi05_g1_pickplace_frozen_vlm",
+        model=pi0_config.Pi0Config(pi05=True, action_dim=32, action_horizon=50),
+        data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/app/train",
+                video_backend="torchcodec",
+                norm_stats="./assets/pi05_g1_pickplace/train/norm_stats.json",
+            ),
+        ),
+        val_data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace_val",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="/app/val",
+                video_backend="torchcodec",
+                norm_stats="./assets/pi05_g1_pickplace/train/norm_stats.json",
+            ),
+            assets=AssetsConfig(asset_id="g1_pickplace"),
+        ),
+        val_interval=50,
+        val_num_batches=20,
+        freeze_filter=nnx.All(
+            nnx_utils.PathRegex(".*(llm|img).*"),          # whole VLM: language + vision.
+            nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),   # ...except the action expert.
+        ),
+        ema_decay=None,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=800,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=1e-6,       # peak == decay -> effectively constant 5e-5 after warmup.
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        wandb_enabled=False,
+        num_train_steps=30_000,
+        batch_size=64,
+        num_workers=2,
+        # Freezing most params shrinks the optimizer state, not the params themselves --
+        # `params` is still the full ~12.5 GiB model. Same OOM history as pi05_g1 applies.
+        async_checkpointing=False,
+        save_train_state=False,
+        # Same disk-headroom reasoning as pi05_g1_pickplace above.
+        save_interval=166,
+        keep_period=None,
+        max_to_keep=2,
+        log_interval=50,
+        seed=0,
+    ),
+
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

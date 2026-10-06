@@ -13,6 +13,7 @@ import jax.experimental
 import jax.numpy as jnp
 import numpy as np
 import optax
+from torch.utils.tensorboard import SummaryWriter
 import tqdm_loggable.auto as tqdm
 import wandb
 
@@ -26,6 +27,22 @@ import openpi.training.optimizer as _optimizer
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
+
+
+import csv
+import os
+log_path = "/mnt/nas/rajat_ws/training_log.csv"
+header = ["step", "train_loss", "val_loss", "grad_norm", "param_norm"]
+# Create file with header if it doesn't exist
+if not os.path.exists(log_path):
+    with open(log_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+
+def log_step(step, loss, val_loss, grad_norm, param_norm):
+    with open(log_path, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([step, loss, val_loss, grad_norm, param_norm])
 
 
 def init_logging():
@@ -191,6 +208,23 @@ def train_step(
     return new_state, info
 
 
+@at.typecheck
+def eval_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions],
+) -> dict[str, at.Array]:
+    """Computes validation loss with no gradient update. Uses the live (non-EMA) params,
+    same as the reported train loss, so the two are directly comparable on one graph."""
+    model = nnx.merge(state.model_def, state.params)
+    model.eval()
+
+    observation, actions = batch
+    chunked_loss = model.compute_loss(rng, observation, actions, train=False)
+    return {"val_loss": jnp.mean(chunked_loss)}
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
@@ -214,8 +248,17 @@ def main(config: _config.TrainConfig):
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        enable_async=config.async_checkpointing,
+        max_to_keep=config.max_to_keep,
+        archive_dir=config.archive_dir,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    tb_dir = config.checkpoint_dir / "tensorboard"
+    tb_dir.mkdir(parents=True, exist_ok=True)
+    tb_writer = SummaryWriter(log_dir=str(tb_dir), flush_secs=30)
+    print(f"Tensorboard directory: {tb_dir}")
+    lr_schedule_fn = config.lr_schedule.create()
 
     data_loader = _data_loader.create_data_loader(
         config,
@@ -226,12 +269,25 @@ def main(config: _config.TrainConfig):
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
+    val_data_loader = None
+    if config.val_data is not None:
+        val_data_loader = _data_loader.create_data_loader(
+            config,
+            sharding=data_sharding,
+            shuffle=False,
+            num_batches=config.val_num_batches,
+            data_config_factory=config.val_data,
+        )
+        logging.info(f"Initialized validation data loader ({config.val_num_batches} batches every "
+                     f"{config.val_interval} steps)")
+
     # Log images from first batch to sanity check.
-    images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
+    camera_views = [
+        np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1)
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
-    wandb.log({"camera_views": images_to_log}, step=0)
+    wandb.log({"camera_views": [wandb.Image(img) for img in camera_views]}, step=0)
+    tb_writer.add_images("camera_views", np.stack(camera_views), 0, dataformats="NHWC")
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -245,6 +301,11 @@ def main(config: _config.TrainConfig):
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
+    )
+    peval_step = jax.jit(
+        functools.partial(eval_step, config),
+        in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+        out_shardings=replicated_sharding,
     )
 
     start_step = int(train_state.step)
@@ -266,14 +327,37 @@ def main(config: _config.TrainConfig):
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
+            tb_writer.add_scalars("loss", {"train": float(reduced_info["loss"])}, step)
+            tb_writer.add_scalar("train/grad_norm", float(reduced_info["grad_norm"]), step)
+            tb_writer.add_scalar("train/param_norm", float(reduced_info["param_norm"]), step)
+            tb_writer.add_scalar("train/learning_rate", float(lr_schedule_fn(step)), step)
             infos = []
         batch = next(data_iter)
 
+        if val_data_loader is not None and step % config.val_interval == 0:
+            eval_rng = jax.random.fold_in(train_rng, step)
+            val_losses = []
+            with sharding.set_mesh(mesh):
+                for i, val_batch in enumerate(val_data_loader):
+                    val_info = peval_step(jax.random.fold_in(eval_rng, i), train_state, val_batch)
+                    val_losses.append(val_info["val_loss"])
+            val_loss = float(jax.device_get(jnp.mean(jnp.stack(val_losses))))
+            pbar.write(f"Step {step}: val_loss={val_loss:.4f}")
+            wandb.log({"val_loss": val_loss}, step=step)
+            tb_writer.add_scalars("loss", {"val": val_loss}, step)
+            log_step(step, float(reduced_info["loss"]), float(val_loss), float(reduced_info["grad_norm"]), float(reduced_info["param_norm"]))
         if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            _checkpoints.save_state(
+                checkpoint_manager,
+                train_state,
+                data_loader,
+                step,
+                save_train_state=config.save_train_state,
+            )
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    tb_writer.close()
 
 
 if __name__ == "__main__":

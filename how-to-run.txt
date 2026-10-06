@@ -1,0 +1,18 @@
+export HF_HOME=/mnt/drive2/rajat_ws/hf_home
+export HF_LEROBOT_HOME=/mnt/drive2/rajat_ws/lerobot_data
+export HF_HUB_DISABLE_XET=1              # see Step 5
+unset LEROBOT_HOME                       # MUST be unset -- see below
+mkdir -p $HF_HOME $HF_LEROBOT_HOME
+uv run scripts/compute_norm_stats.py --config-name pi05_g1_pickplace
+
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_g1_pickplace --exp-name=my_experiment --overwrite
+
+uv pip install   --python /.venv/bin/python   --upgrade   "protobuf>=6.31.1,<8"
+
+CUDA_LAUNCH_BLOCKING=1 XLA_PYTHON_CLIENT_MEM_FRACTION=0.9  uv run scripts/train_pytorch.py pi05_g1_pickplace --exp_name 830_episode_train --save_interval 166 --overwrite
+
+sudo fallocate -l 48G /swapfile2
+sudo chmod 600 /swapfile2
+sudo mkswap /swapfile2
+sudo swapon /swapfile2
+free -h

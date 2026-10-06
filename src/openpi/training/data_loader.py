@@ -137,12 +137,23 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    # `local_root` points LeRobot straight at a dataset directory. Without it LeRobot treats
+    # repo_id as a Hub name and reaches out to huggingface.co when the dataset is not found
+    # under $HF_LEROBOT_HOME.
+    root = data_config.local_root
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root)
+    dataset_kwargs = {}
+    if data_config.video_backend is not None:
+        dataset_kwargs["video_backend"] = data_config.video_backend
+
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=root,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
+        **dataset_kwargs,
     )
 
     if data_config.prompt_from_task:
@@ -172,6 +183,8 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
+    print(f"Skipping norm stats: {skip_norm_stats}")
+    print(f"data_config.repo_id: {data_config.repo_id}")
     if data_config.repo_id != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
@@ -228,6 +241,7 @@ def create_data_loader(
     num_batches: int | None = None,
     skip_norm_stats: bool = False,
     framework: Literal["jax", "pytorch"] = "jax",
+    data_config_factory: _config.DataConfigFactory | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -238,8 +252,10 @@ def create_data_loader(
         num_batches: Determines the number of batches to return.
         skip_norm_stats: Whether to skip data normalization.
         framework: The framework to use ("jax" or "pytorch").
+        data_config_factory: Which data config to build the loader from. Defaults to
+            `config.data`; pass `config.val_data` to build a validation loader instead.
     """
-    data_config = config.data.create(config.assets_dirs, config.model)
+    data_config = (data_config_factory or config.data).create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
     if data_config.rlds_data_dir is not None:
@@ -300,6 +316,7 @@ def create_torch_data_loader(
         seed: The seed to use for shuffling the data.
     """
     dataset = create_torch_dataset(data_config, action_horizon, model_config)
+
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
     # Use TorchDataLoader for both frameworks

@@ -14,6 +14,7 @@ WORKDIR /app
 
 # Needed because LeRobot uses git-lfs.
 RUN apt-get update && apt-get install -y git git-lfs linux-headers-generic build-essential clang
+RUN apt-get update && apt-get install -y ffmpeg libavcodec-dev libavformat-dev libavutil-dev
 
 # Copy from the cache instead of linking since it's a mounted volume
 ENV UV_LINK_MODE=copy
@@ -22,6 +23,7 @@ ENV UV_LINK_MODE=copy
 # leak out of the container when we mount the application code.
 ENV UV_PROJECT_ENVIRONMENT=/.venv
 
+# After installing torch:
 # Install the project's dependencies using the lockfile and settings
 RUN uv venv --python 3.11.9 $UV_PROJECT_ENVIRONMENT
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -30,6 +32,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=packages/openpi-client/pyproject.toml,target=packages/openpi-client/pyproject.toml \
     --mount=type=bind,source=packages/openpi-client/src,target=packages/openpi-client/src \
     GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen --no-install-project --no-dev
+
+RUN uv pip install tensorboard
+RUN uv pip install --upgrade "protobuf>=6.31.1,<8"
+RUN uv pip install "torchcodec"
 
 # Copy transformers_replace files while preserving directory structure
 COPY src/openpi/models_pytorch/transformers_replace/ /tmp/transformers_replace/

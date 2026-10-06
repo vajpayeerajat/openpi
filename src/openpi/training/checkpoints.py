@@ -16,10 +16,23 @@ import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
 
-
 def initialize_checkpoint_dir(
-    checkpoint_dir: epath.Path | str, *, keep_period: int | None, overwrite: bool, resume: bool
+    checkpoint_dir: epath.Path | str,
+    *,
+    keep_period: int | None,
+    overwrite: bool,
+    resume: bool,
+    enable_async: bool = True,
+    max_to_keep: int = 1,
+    archive_dir: epath.Path | str = None,
 ) -> tuple[ocp.CheckpointManager, bool]:
+    """Create the checkpoint manager.
+
+    `enable_async=False` trades save speed for peak host RAM. Async saves copy the whole
+    TrainState -- params + Adam mu + Adam nu + ema_params, so 4x the parameter bytes -- into
+    host memory so training can continue while the write happens in the background. For
+    pi0.5 that is ~50 GiB, which OOM-kills the process on a 62 GiB host at the first save.
+    """
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     resuming = False
     if checkpoint_dir.exists():
@@ -45,9 +58,10 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            max_to_keep=max_to_keep,
             keep_period=keep_period,
             create=False,
+            enable_async_checkpointing=enable_async,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
         ),
     )
@@ -67,6 +81,8 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    save_train_state: bool = False,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -78,13 +94,20 @@ def save_state(
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
         train_state, params = _split_params(state)
+
     items = {
         "assets": save_assets,
-        "train_state": train_state,
         "params": {"params": params},
     }
-    checkpoint_manager.save(step, items)
 
+    if save_train_state: ## Added by Rajat, to save the train_state. 
+        # saving train state along with params takes up 50 GiB of memory, which OOMs on a 62 GiB host for unfrozen pi0.5.
+        # which makes the training crash at 64GB ram. So, we are not saving the train state.
+        # Full resumable checkpoint: params + optimizer state + EMA.
+        # This is the mode that OOMs on a 62 GiB host for unfrozen pi0.5.
+        items["train_state"] = train_state
+
+    checkpoint_manager.save(step, items)
 
 def restore_state(
     checkpoint_manager: ocp.CheckpointManager,

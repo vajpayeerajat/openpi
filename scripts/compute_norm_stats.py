@@ -50,7 +50,7 @@ def create_torch_dataloader(
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
-        num_workers=num_workers,
+        num_workers=8,
         shuffle=shuffle,
         num_batches=num_batches,
     )
@@ -88,6 +88,7 @@ def create_rlds_dataloader(
 
 def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
+    print(config)
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
