@@ -72,7 +72,7 @@ class DataConfig:
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
-    norm_stats: dict[str, _transforms.NormStats] | None = None
+    norm_stats: dict[str, _transforms.NormStats] | None = './assets/pi05_g1_pickplace/train/norm_stats.json'
 
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
@@ -562,7 +562,7 @@ class TrainConfig:
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm"
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
