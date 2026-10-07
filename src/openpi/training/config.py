@@ -1303,7 +1303,7 @@ _CONFIGS = [
             # Warm up over ~1 epoch (166 steps) instead of 6 epochs
             warmup_steps=166,
             peak_lr=5e-5,       # Standard starting point for fine-tuning openpi/robotics tasks
-            decay_steps=5_000,   # Matches your total steps for a clean decay curve
+            decay_steps=20_000,   # Matches your total steps for a clean decay curve
             decay_lr=1e-6,       # Let it decay to a minimum value to stabilize training at the end
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
@@ -1311,8 +1311,8 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         wandb_enabled=False,  # No W&B account -- TensorBoard (checkpoint_dir/tensorboard) is
                               # the monitoring path here; every logged scalar also goes to stdout.
-        num_train_steps=5_000,
-        batch_size=32,
+        num_train_steps=20_000,
+        batch_size=4,
         num_workers=2,
         # Same OOM history as pi05_g1 on this host (62 GiB RAM): async + full train-state
         # saves (params + Adam mu/nu + ema) OOM-killed that run at step 2500. Stream
