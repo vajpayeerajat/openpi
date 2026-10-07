@@ -37,9 +37,11 @@ import safetensors.torch
 import torch
 import torch.distributed as dist
 import torch.nn.parallel
+from torch.utils.tensorboard import SummaryWriter
 import tqdm
 import wandb
 
+import openpi.models.cosmos_config
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.shared.normalize as _normalize
@@ -146,6 +148,23 @@ def get_model_parameters(model):
     )
 
 
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def saves_trainable_only(model) -> bool:
+    """Models with a large frozen backbone (CosmosPi05Pytorch) checkpoint only their trainable parameters."""
+    return hasattr(unwrap_model(model), "trainable_state_dict")
+
+
+def load_model_weights(model, path, device="cpu"):
+    model = unwrap_model(model)
+    if hasattr(model, "load_trainable_weights"):
+        model.load_trainable_weights(path, device=device)
+    else:
+        safetensors.torch.load_model(model, path, device=str(device))
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
@@ -163,8 +182,11 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
         # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        model_to_save = unwrap_model(model)
+        if saves_trainable_only(model_to_save):
+            safetensors.torch.save_file(model_to_save.trainable_state_dict(), tmp_ckpt_dir / "model.safetensors")
+        else:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -220,8 +242,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
         safetensors_path = ckpt_dir / "model.safetensors"
 
         if safetensors_path.exists():
-            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            load_model_weights(model, safetensors_path, device=device)
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -269,6 +290,88 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
                 "Out of memory while loading checkpoint. Try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
             ) from e
         raise
+
+
+def build_val_loader(config: _config.TrainConfig):
+    """Data loader over `config.val_repo_id`, using the train split's norm stats."""
+    val_data = dataclasses.replace(
+        config.data,
+        repo_id=config.val_repo_id,
+        assets=_config.AssetsConfig(
+            assets_dir=config.data.assets.assets_dir or str(config.assets_dirs),
+            asset_id=config.data.assets.asset_id or config.data.repo_id,
+        ),
+    )
+    val_config = dataclasses.replace(config, data=val_data)
+    return _data.create_data_loader(val_config, framework="pytorch", shuffle=True)
+
+
+def get_action_metric_groups(config: _config.TrainConfig) -> dict[str, tuple[int, int]]:
+    """Action-dim ranges to report metrics on. Padding dims are left out: after quantile normalisation they are a
+    constant -1, so including them would inflate every metric."""
+    if isinstance(config.data, _config.LeRobotG1Dex3DataConfig):
+        # 28 upper-body dims, ordered [L_arm 7, L_hand 7, R_arm 7, R_hand 7] (see g1_dex3_policy.py).
+        return {"left_arm": (0, 7), "left_hand": (7, 14), "right_arm": (14, 21), "right_hand": (21, 28), "all": (0, 28)}
+    return {"all": (0, config.model.action_dim)}
+
+
+# Tolerances (in normalised action units, where the action range is roughly [-1, 1]) for the "accuracy" metrics.
+ACCURACY_TOLERANCES = (0.05, 0.1)
+
+
+def action_metrics(pred: torch.Tensor, target: torch.Tensor, groups: dict[str, tuple[int, int]]) -> dict[str, float]:
+    """Metrics of fully denoised action chunks vs. ground truth, both [B, horizon, action_dim], normalised space.
+
+    Flow matching has no classification accuracy; `acc@tol` is the closest analogue: the fraction of predicted action
+    values within `tol` of the target. `first_step_l1` is the error on the first action of the chunk, the one executed
+    right away.
+    """
+    out = {}
+    for name, (lo, hi) in groups.items():
+        err = (pred[..., lo:hi] - target[..., lo:hi]).abs()
+        out[f"{name}/l1"] = err.mean().item()
+        out[f"{name}/mse"] = err.square().mean().item()
+        if name == "all":
+            out["all/first_step_l1"] = err[:, 0].mean().item()
+            for tol in ACCURACY_TOLERANCES:
+                out[f"all/acc@{tol}"] = (err < tol).float().mean().item()
+    return out
+
+
+def _mean_dicts(dicts: list[dict[str, float]]) -> dict[str, float]:
+    return {k: sum(d[k] for d in dicts) / len(dicts) for k in dicts[0]}
+
+
+@torch.no_grad()
+def evaluate_batches(model, batches, device, groups, *, num_denoise_steps: int = 10) -> dict[str, float]:
+    """Flow-matching loss plus action metrics from actually sampling actions (no augmentation, eval mode)."""
+    model_to_eval = unwrap_model(model)
+    was_training = model_to_eval.training
+    model_to_eval.eval()
+    results = []
+    for observation, actions in batches:
+        observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
+        actions = actions.to(torch.float32).to(device)  # noqa: PLW2901
+        metrics = {"loss": model_to_eval(observation, actions).mean().item()}
+        pred = model_to_eval.sample_actions(device, observation, num_steps=num_denoise_steps)
+        metrics.update(action_metrics(pred.float(), actions, groups))
+        results.append(metrics)
+    model_to_eval.train(was_training)
+    return _mean_dicts(results)
+
+
+def log_eval(writer, split: str, metrics: dict[str, float], step: int, *, wandb_enabled: bool):
+    parts = [f"{k}={v:.4f}" for k, v in metrics.items() if k in ("loss", "all/l1", "all/acc@0.05", "all/acc@0.1")]
+    logging.info(f"step={step} [{split}] " + " ".join(parts))
+    if writer is not None:
+        for k, v in metrics.items():
+            if k == 'loss':
+                writer.add_scalar(f"{k}/{split}", v, step)
+            else:
+                writer.add_scalar(f"{split}/{k}", v, step)
+        writer.flush()
+    if wandb_enabled:
+        wandb.log({f"{split}/{k}": v for k, v in metrics.items()}, step=step)
 
 
 def get_latest_checkpoint_step(checkpoint_dir):
@@ -390,7 +493,11 @@ def train_loop(config: _config.TrainConfig):
         logging.info("Cleared sample batch and data loader from memory")
 
     # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+    if isinstance(config.model, openpi.models.cosmos_config.CosmosPi05Config):
+        # Loads the VLM from `vlm_path`; trainable/frozen split and dtypes are set by the model itself.
+        model_cfg = config.model
+        model = model_cfg.create_pytorch().to(device)
+    elif not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
         model_cfg = openpi.models.pi0_config.Pi0Config(
             dtype=config.pytorch_training_precision,
@@ -406,7 +513,8 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    if not isinstance(config.model, openpi.models.cosmos_config.CosmosPi05Config):
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -443,9 +551,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        load_model_weights(model, model_path)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
@@ -455,8 +561,13 @@ def train_loop(config: _config.TrainConfig):
     end_lr = config.lr_schedule.decay_lr
 
     # Create optimizer with config parameters
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # Models can split params into groups with an `lr_scale` (e.g. a smaller LR for pretrained VLM layers).
+    model_param_groups = (
+        unwrap_model(model).param_groups() if hasattr(unwrap_model(model), "param_groups") else trainable_params
+    )
     optim = torch.optim.AdamW(
-        model.parameters(),
+        model_param_groups,
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
@@ -478,6 +589,20 @@ def train_loop(config: _config.TrainConfig):
         progress = min(1.0, (step - warmup_steps) / max(1, decay_steps - warmup_steps))
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
+
+    # TensorBoard: `tensorboard --logdir <checkpoint_base_dir>/<config>/` shows every run of the config.
+    writer = None
+    if is_main:
+        tb_dir = config.checkpoint_dir / "tensorboard"
+        # purge_step drops events past the resume step left over from an interrupted run.
+        writer = SummaryWriter(log_dir=str(tb_dir), purge_step=global_step if resuming else None)
+        logging.info(f"TensorBoard logs: {tb_dir}")
+    metric_groups = get_action_metric_groups(config)
+
+    val_iter = None
+    if config.val_repo_id is not None and is_main:
+        val_iter = iter(build_val_loader(config))
+        logging.info(f"Validation on {config.val_repo_id}: {config.val_num_batches} batches every {config.val_interval} steps")
 
     model.train()
     start_time = time.time()
@@ -523,7 +648,7 @@ def train_loop(config: _config.TrainConfig):
 
             # Update LR
             for pg in optim.param_groups:
-                pg["lr"] = lr_schedule(global_step)
+                pg["lr"] = lr_schedule(global_step) * pg.get("lr_scale", 1.0)
 
             # Forward pass
             losses = model(observation, actions)
@@ -543,7 +668,7 @@ def train_loop(config: _config.TrainConfig):
                 log_memory_usage(device, global_step, "after_backward")
 
             # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=config.optimizer.clip_gradient_norm)
 
             # Optimizer step
             optim.step()
@@ -585,6 +710,13 @@ def train_loop(config: _config.TrainConfig):
                     else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
                 )
 
+                if writer is not None:
+                    writer.add_scalar("loss/train", avg_loss, global_step)
+                    writer.add_scalar("train/learning_rate", avg_lr, global_step)
+                    writer.add_scalar("train/time_per_step", elapsed / max(1, len(infos)), global_step)
+                    if avg_grad_norm is not None:
+                        writer.add_scalar("train/grad_norm", avg_grad_norm, global_step)
+
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
                     log_payload = {
@@ -600,6 +732,16 @@ def train_loop(config: _config.TrainConfig):
                 start_time = time.time()
                 infos = []  # Reset stats collection
 
+            if is_main and global_step % config.val_interval == 0:
+                # Same metrics on the current training batch (clean images, eval mode) to compare train vs val, e.g.
+                # to spot overfitting. One batch, so noisier than the val numbers.
+                train_metrics = evaluate_batches(model, [(observation, actions)], device, metric_groups)
+                log_eval(writer, "train_eval", train_metrics, global_step, wandb_enabled=config.wandb_enabled)
+                if val_iter is not None:
+                    val_batches = [next(val_iter) for _ in range(config.val_num_batches)]
+                    val_metrics = evaluate_batches(model, val_batches, device, metric_groups)
+                    log_eval(writer, "val", val_metrics, global_step, wandb_enabled=config.wandb_enabled)
+
             global_step += 1
             # Save checkpoint using the new mechanism
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
@@ -614,6 +756,9 @@ def train_loop(config: _config.TrainConfig):
     # Close progress bar
     if pbar is not None:
         pbar.close()
+
+    if writer is not None:
+        writer.close()
 
     # Finish wandb run
     if is_main and config.wandb_enabled:

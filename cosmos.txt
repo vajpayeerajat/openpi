@@ -1,0 +1,36 @@
+
+export HF_LEROBOT_HOME=/mnt/drive2/rajat_ws/lerobot_data
+PY=~/venvs/openpi_cosmos/bin/python
+
+# 1. One-time: request access at https://huggingface.co/nvidia/Cosmos-Reason2-8B, then
+~/venvs/openpi_cosmos/bin/hf auth login
+
+# 2. One-time: norm stats -> ./assets/cosmos2_8b_g1_pickplace/train  (~20 min on a 40k-frame random subset; the full set takes ~3 h)
+JAX_PLATFORMS=cpu $PY scripts/compute_norm_stats.py --config-name cosmos2_8b_g1_pickplace --max-frames 40000
+
+# 3. Stage 1: frozen 8B, train the action expert (~1.9 s/step -> ~16 h for 30k steps, 54 GB GPU)
+$PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name run1
+#    Resume after an interruption: add --resume
+
+# 4. Optional stage 2: LoRA on the LLM, starting from stage 1 (~4.2 s/step)
+$PY scripts/train_pytorch.py cosmos2_8b_lora_g1_pickplace --exp-name run1 \
+    --pytorch-weight-path checkpoints/cosmos2_8b_g1_pickplace/run1/29999
+
+# 5. Serve
+$PY scripts/serve_policy.py --port 8017 policy:checkpoint \
+    --policy.config=cosmos2_8b_g1_pickplace --policy.dir=checkpoints/cosmos2_8b_g1_pickplace/run1/29999
+
+
+~/venvs/openpi_cosmos/bin/tensorboard --logdir /mnt/nas/rajat_ws/openpi-et-robotics-implementation/checkpoints/cosmos2_8b_g1_pickplace --port 6006 --bind_all
+
+
+cd /mnt/nas/rajat_ws/openpi-et-robotics-implementation
+export HF_LEROBOT_HOME=$HOME/scratch/openpi
+PY=~/venvs/openpi_cosmos/bin/python
+
+# Warm-start from your stage-1 run (recommended, once run1_cosmos has a checkpoint)
+$PY scripts/train_pytorch.py cosmos2_8b_last2_g1_pickplace --exp-name last2_run1 \
+    --pytorch-weight-path checkpoints/cosmos2_8b_g1_pickplace/run1_cosmos/<step>
+
+# Or from scratch, with 4 unfrozen layers instead of 2
+$PY scripts/train_pytorch.py cosmos2_8b_last2_g1_pickplace --exp-name last4_run1 --model.train-llm-last-n-layers 4
