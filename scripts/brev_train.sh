@@ -129,15 +129,24 @@ hf_download "$VLM_REPO_ID"
 # ---------------------------------------------------------------------------------------------------------------------
 # 4. Data: the config reads local_root="train" / "val" relative to the repo root.
 # ---------------------------------------------------------------------------------------------------------------------
-log "Downloading dataset $DATA_REPO_ID (7.3 GB, skipped if present)"
-hf_download "$DATA_REPO_ID" --repo-type dataset --include "train/*" "val/*" --local-dir "$WORK_DIR/data"
+# DATA_DIR=/path/with/train_and_val uses a dataset copied over by hand (brev copy / rsync) instead of downloading it.
+if [[ -n "${DATA_DIR:-}" ]]; then
+    for split in train val; do
+        [[ -f "$DATA_DIR/$split/meta/info.json" ]] || die "DATA_DIR=$DATA_DIR has no $split/meta/info.json"
+    done
+    log "Using the local dataset in $DATA_DIR (no download)"
+else
+    DATA_DIR="$WORK_DIR/data"
+    log "Downloading dataset $DATA_REPO_ID (7.3 GB, skipped if present)"
+    hf_download "$DATA_REPO_ID" --repo-type dataset --include "train/*" "val/*" --local-dir "$DATA_DIR"
+fi
 for split in train val; do
     if [[ -L "$split" ]]; then
-        ln -sfn "$WORK_DIR/data/$split" "$split"
+        ln -sfn "$DATA_DIR/$split" "$split"
     elif [[ -e "$split" ]]; then
         log "./$split already exists and is not a symlink; using it as is"
     else
-        ln -s "$WORK_DIR/data/$split" "$split"
+        ln -s "$DATA_DIR/$split" "$split"
     fi
 done
 
