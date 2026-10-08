@@ -73,7 +73,7 @@ class DataConfig:
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
-    norm_stats: dict[str, _transforms.NormStats] | None = '/mnt/drive2/rajat_ws/tasks/openpi/assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json'
+    norm_stats: dict[str, _transforms.NormStats] | None = './assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json'
     
     video_backend: str | None = None
     # Used to adopt the inputs from a dataset specific format to a common format
@@ -1213,7 +1213,7 @@ _CONFIGS = [
                 local_root="train",
                 video_backend="torchcodec",
                 asset_id="g1_pickplace",
-                norm_stats="/mnt/drive2/rajat_ws/tasks/openpi/assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+                norm_stats="./assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
             ),
         ),
         val_data=LeRobotG1DataConfig(
@@ -1223,7 +1223,7 @@ _CONFIGS = [
                 local_root="val",
                 video_backend="torchcodec",
                 asset_id="g1_pickplace",
-                norm_stats="/mnt/drive2/rajat_ws/tasks/openpi/assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+                norm_stats="./assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
             ),
             assets=AssetsConfig(asset_id="g1_pickplace"),
         ),

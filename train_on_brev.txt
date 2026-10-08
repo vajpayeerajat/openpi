@@ -15,3 +15,18 @@ $PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name stage1_brev \
     --overwrite
 
 # instance died? On a new one, same command with --resume instead of --overwrite
+
+
+
+# 1. create the target dir
+ssh -i ~/.brev/brev.pem -p 22 shadeform@216.81.200.25 \
+    'sudo mkdir -p /lerobot_data && sudo chown shadeform:shadeform /lerobot_data'
+
+# 2. copy each split
+rsync -avP -e "ssh -i ~/.brev/brev.pem -p 22" \
+    /mnt/drive2/rajat_ws/lerobot_data/train/ shadeform@216.81.200.25:/lerobot_data/train/
+rsync -avP -e "ssh -i ~/.brev/brev.pem -p 22" \
+    /mnt/drive2/rajat_ws/lerobot_data/val/   shadeform@216.81.200.25:/lerobot_data/val/
+
+# 3. verify (~5.5 GB / 1.4 GB)
+ssh -i ~/.brev/brev.pem -p 22 shadeform@216.81.200.25 'du -sh /lerobot_data/train /lerobot_data/val'
