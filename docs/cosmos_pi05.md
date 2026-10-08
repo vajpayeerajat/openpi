@@ -39,6 +39,7 @@ Blackwell (sm_120) kernels. This model needs `transformers>=4.57` and torch buil
 
 ```bash
 uv venv ~/venvs/openpi_cosmos --python 3.11
+source /home/rajatvajpayee/venvs/openpi_cosmos/bin/activate
 export VIRTUAL_ENV=~/venvs/openpi_cosmos UV_HTTP_TIMEOUT=900
 uv pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128 \
     --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match

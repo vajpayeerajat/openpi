@@ -21,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.g1_policy as g1_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -72,8 +73,9 @@ class DataConfig:
     # Directory within the assets directory containing the data assets.
     asset_id: str | None = None
     # Contains precomputed normalization stats. If None, normalization will not be performed.
-    norm_stats: dict[str, _transforms.NormStats] | None = './assets/pi05_g1_pickplace/train/norm_stats.json'
-
+    norm_stats: dict[str, _transforms.NormStats] | None = '/mnt/drive2/rajat_ws/tasks/openpi/assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json'
+    
+    video_backend: str | None = None
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
@@ -90,6 +92,8 @@ class DataConfig:
     # sequence is defined by the `action_horizon` field in the model config. This should be adjusted if your
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
+
+    local_root: str | None = None
 
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
@@ -238,6 +242,68 @@ class SimpleDataConfig(DataConfigFactory):
             self.create_base_config(assets_dirs, model_config),
             data_transforms=self.data_transforms(model_config),
             model_transforms=self.model_transforms(model_config),
+        )
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotG1DataConfig(DataConfigFactory):
+    """Data config for Unitree G1 upper-body LeRobot dataset."""
+
+    default_prompt: str | None = None
+
+    # Maps the LeRobot dataset feature names onto the keys that `g1_policy.G1Inputs`
+    # consumes (which are also the keys a policy client must send at inference time).
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "observation/image": "observation.images.ego_view",
+                        "observation/left_wrist_image": "observation.images.ego_left",
+                        "observation/right_wrist_image": "observation.images.ego_right",
+                        "observation/state": "observation.state",
+                        "actions": "action",
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(
+        self,
+        assets_dirs: pathlib.Path,
+        model_config: _model.BaseModelConfig,
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[g1_policy.G1Inputs()],
+            outputs=[g1_policy.G1Outputs()],
+        )
+
+        # Action dims are [L_arm 7, L_hand 7, R_arm 7, R_hand 7]. Arms are trained as
+        # deltas from the current joint position -- easier to predict than an absolute
+        # angle, and it turns the near-idle left arm into a ~0 target instead of a pose
+        # the policy would have to memorise. Hands stay absolute: they hold open or closed
+        # for long stretches, and near-zero deltas accumulate integration error that drifts
+        # the grip open across a 50-step chunk.
+        delta_action_mask = _transforms.make_bool_mask(7, -7, 7, -7)
+        data_transforms = data_transforms.push(
+            inputs=[_transforms.DeltaActions(delta_action_mask)],
+            outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+        )
+
+        model_transforms = ModelTransformFactory(
+            default_prompt=self.default_prompt
+        )(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -534,6 +600,7 @@ class TrainConfig:
     project_name: str = "openpi"
     # Experiment name. Will be used to name the metadata and checkpoint directories.
     exp_name: str = tyro.MISSING
+    val_repo_id: str = None
 
     # Defines the model config. Some attributes (action_dim, action_horizon, and max_token_len) are shared by all models
     # -- see BaseModelConfig. Specific model implementations (e.g., Pi0Config) inherit from BaseModelConfig and may
@@ -559,15 +626,23 @@ class TrainConfig:
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=FakeDataConfig)
 
+    # Held-out data used to compute validation loss. If None, validation is skipped.
+    val_data: DataConfigFactory | None = None
+    # How often (in steps) to compute validation loss.
+    val_interval: int = 166
+    # Number of batches to average over each time validation loss is computed.
+    val_num_batches: int = 10
+
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
-    checkpoint_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm"
-
+    checkpoint_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm" ## Added by Rajat
+    archive_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm" ## Added by Rajat
+    # checkpoint_dir: str = "./checkpoints/rajat"
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
+    batch_size: int = 4
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -575,17 +650,32 @@ class TrainConfig:
     num_train_steps: int = 30_000
 
     # How often (in steps) to log training metrics.
-    log_interval: int = 100
-    # Optional held-out LeRobot dataset (resolved like `data.repo_id`, i.e. $HF_LEROBOT_HOME/<val_repo_id>) used for a
-    # validation loss. It goes through the same transforms and the train split's norm stats. PyTorch trainer only.
-    val_repo_id: str | None = None
-    # How often (in steps) to compute the validation loss, and over how many batches.
-    val_interval: int = 500
-    val_num_batches: int = 20
+    log_interval: int = 50
     # How often (in steps) to save checkpoints.
-    save_interval: int = 1000
+    save_interval: int = 166
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Rolling window of how many of the most recent checkpoints to keep on disk (on top of
+    # anything pinned by keep_period). Raise this once more disk is free; each save is
+    # ~12.5 GiB with save_train_state=False, ~50 GiB with it True.
+    max_to_keep: int = 100
+
+    # Write the optimizer state alongside params. Orbax materialises everything it saves in
+    # host RAM first, so this is the difference between a 50 GiB and a 12.5 GiB save:
+    #   True  -> params 12.5 + train_state (params + Adam mu + nu) 37.5 = 50 GiB
+    #   False -> params 12.5 GiB only
+    # 50 GiB does not fit beside training on a 62 GiB host; it was OOM-killed at every save.
+    # False means --resume cannot continue a run (a crash restarts from step 0), but `params`
+    # is all serve_policy.py and the robot need.
+    save_train_state: bool = False
+
+    # Save checkpoints asynchronously (training continues while the write happens).
+    # Async holds the entire TrainState -- params + Adam mu + Adam nu + ema_params, i.e. 4x
+    # the parameter bytes -- in host RAM for the duration of the write. That is ~50 GiB for
+    # pi0.5, which the kernel OOM-killed at the first save on this 62 GiB host. Set False to
+    # stream the save to disk instead: each save blocks training for a few minutes, but peak
+    # host RAM stays near the steady-state footprint.
+    async_checkpointing: bool = False
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -615,6 +705,13 @@ class TrainConfig:
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()
+
+    @property
+    def archive_dir(self) -> pathlib.Path:
+        """Get the archive directory for this config."""
+        if not self.exp_name:
+            raise ValueError("--exp_name must be set")
+        return (pathlib.Path(self.archive_base_dir) / self.name / self.exp_name).resolve()
 
     @property
     def trainable_filter(self) -> nnx.filterlib.Filter:
@@ -1097,13 +1194,29 @@ _CONFIGS = [
             train_vision_merger=False,
             llm_lora_rank=0,
         ),
-        data=LeRobotG1Dex3DataConfig(
-            repo_id="train",      # $HF_LEROBOT_HOME/train; norm stats go to ./assets/cosmos2_8b_g1_pickplace/train
-            base_config=DataConfig(prompt_from_task=True),
+        data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="train",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="/mnt/drive2/rajat_ws/tasks/openpi/assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+            ),
         ),
-        val_repo_id="val",        # $HF_LEROBOT_HOME/val, evaluated with the train norm stats
-        val_interval=500,
-        val_num_batches=50,
+        val_data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace_val",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="val",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="/mnt/drive2/rajat_ws/tasks/openpi/assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+            ),
+            assets=AssetsConfig(asset_id="g1_pickplace"),
+        ),
+        val_interval=42,
+        val_num_batches=42,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=800,
             peak_lr=2.5e-5,
@@ -1114,13 +1227,13 @@ _CONFIGS = [
         ema_decay=None,           # the PyTorch trainer does not implement EMA
         wandb_enabled=False,
         num_train_steps=30_000,   # ~7.3 epochs over 130,856 frames at batch 32
-        batch_size=32,
+        batch_size=16,
         # Decoding 3 x 640x480 videos per sample runs at ~3 samples/s per worker; a step at batch 32 takes ~1.9 s,
         # so fewer than ~6 workers leaves the GPU waiting. The host has 20 cores.
         num_workers=2,
-        save_interval=200,
+        save_interval=42,
         keep_period=100,
-        log_interval=200,
+        log_interval=20,
         seed=0,
     ),
     # Middle option: action expert + the last N (=2) LLM decoder layers fully fine-tuned; everything else frozen.
@@ -1160,7 +1273,7 @@ _CONFIGS = [
         ema_decay=None,
         wandb_enabled=False,
         num_train_steps=30_000,
-        batch_size=32,
+        batch_size=4,
         num_workers=2,
         save_interval=2_500,
         keep_period=2_500,

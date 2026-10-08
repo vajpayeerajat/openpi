@@ -293,7 +293,10 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
 
 def build_val_loader(config: _config.TrainConfig):
-    """Data loader over `config.val_repo_id`, using the train split's norm stats."""
+    """Data loader over `config.val_data` (or `config.val_repo_id`), using the train split's norm stats."""
+    if config.val_data is not None:
+        # The config's val_data is responsible for pointing its assets at the train norm stats.
+        return _data.create_data_loader(dataclasses.replace(config, data=config.val_data), framework="pytorch", shuffle=True)
     val_data = dataclasses.replace(
         config.data,
         repo_id=config.val_repo_id,
@@ -365,8 +368,10 @@ def log_eval(writer, split: str, metrics: dict[str, float], step: int, *, wandb_
     logging.info(f"step={step} [{split}] " + " ".join(parts))
     if writer is not None:
         for k, v in metrics.items():
-            if k == 'loss':
-                writer.add_scalar(f"{k}/{split}", v, step)
+            if k == "loss":
+                # add_scalars writes each split to its own sub-run under one "loss" tag, so train, train_eval and
+                # val are overlaid on a single chart in the Scalars tab.
+                writer.add_scalars("loss", {split: v}, step)
             else:
                 writer.add_scalar(f"{split}/{k}", v, step)
         writer.flush()
@@ -600,9 +605,10 @@ def train_loop(config: _config.TrainConfig):
     metric_groups = get_action_metric_groups(config)
 
     val_iter = None
-    if config.val_repo_id is not None and is_main:
+    if (config.val_data is not None or config.val_repo_id is not None) and is_main:
         val_iter = iter(build_val_loader(config))
-        logging.info(f"Validation on {config.val_repo_id}: {config.val_num_batches} batches every {config.val_interval} steps")
+        val_name = config.val_data.repo_id if config.val_data is not None else config.val_repo_id
+        logging.info(f"Validation on {val_name}:{config.val_num_batches} batches every {config.val_interval} steps")
 
     model.train()
     start_time = time.time()
@@ -711,7 +717,7 @@ def train_loop(config: _config.TrainConfig):
                 )
 
                 if writer is not None:
-                    writer.add_scalar("loss/train", avg_loss, global_step)
+                    writer.add_scalars("loss", {"train": avg_loss}, global_step)
                     writer.add_scalar("train/learning_rate", avg_lr, global_step)
                     writer.add_scalar("train/time_per_step", elapsed / max(1, len(infos)), global_step)
                     if avg_grad_norm is not None:

@@ -4,7 +4,7 @@ Text file for the fix
 We trained out bot using only right hand and the entries 7-13 only have zeros which indicates the left hand movement.
 It means, we should not inlcude this in training. If it is included, loss would shoot up resulting in unstable training. Hence this diff is the fix of it. 
 
-
+## Check is_stats_norm_valid.py file to verify if geenerate norm file is correct. 
 
 dim | q99-q01 | max |normalized| | mean normalized^2
   0 |  0.1266 |          3.5 |          0.1
