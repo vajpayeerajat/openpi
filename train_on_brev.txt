@@ -30,3 +30,19 @@ rsync -avP -e "ssh -i ~/.brev/brev.pem -p 22" \
 
 # 3. verify (~5.5 GB / 1.4 GB)
 ssh -i ~/.brev/brev.pem -p 22 shadeform@216.81.200.25 'du -sh /lerobot_data/train /lerobot_data/val'
+
+
+## To download checkpoint
+
+SSH="ssh -i ~/.brev/brev.pem -p 22"
+SRC=shadeform@216.81.200.25:/ephemeral/openpi_work/checkpoints/cosmos2_8b_g1_pickplace/stage1_brev
+DST=/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm/cosmos2_8b_g1_pickplace/stage1_brev
+
+# latest checkpoint
+rsync -avP -e "$SSH" $SRC/1000 $DST/
+
+# only what you need to visualize or serve (2.2 GB instead of 6.6 GB)
+rsync -avP -e "$SSH" --exclude optimizer.pt $SRC/1000 $DST/
+
+# tensorboard logs
+rsync -avP -e "$SSH" $SRC/tensorboard $DST/
