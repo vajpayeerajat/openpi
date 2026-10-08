@@ -1,4 +1,11 @@
-
+uv venv ~/venvs/openpi_cosmos --python 3.11
+source /home/rajatvajpayee/venvs/openpi_cosmos/bin/activate
+export VIRTUAL_ENV=~/venvs/openpi_cosmos UV_HTTP_TIMEOUT=900
+uv pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128 \
+    --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+printf "ml-dtypes==0.4.1\ntensorstore==0.1.74\ntransformers==4.57.1\ntorch==2.7.1\ntorchvision==0.22.1\ndatasets==3.6.0\ntorchcodec==0.5\n" > /tmp/ovr.txt
+uv pip install -e . -e packages/openpi-client --override /tmp/ovr.txt
+uv pip install tensorboard
 export HF_LEROBOT_HOME=/mnt/drive2/rajat_ws/lerobot_data
 PY=~/venvs/openpi_cosmos/bin/python
 
@@ -9,7 +16,7 @@ PY=~/venvs/openpi_cosmos/bin/python
 JAX_PLATFORMS=cpu $PY scripts/compute_norm_stats.py --config-name cosmos2_8b_g1_pickplace --max-frames 40000
 
 # 3. Stage 1: frozen 8B, train the action expert (~1.9 s/step -> ~16 h for 30k steps, 54 GB GPU)
-$PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name run1
+$ $PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name stage1 --batch_size 16 --val_interval 42 --save_interval 42  --overwrite
 #    Resume after an interruption: add --resume
 
 # 4. Optional stage 2: LoRA on the LLM, starting from stage 1 (~4.2 s/step)

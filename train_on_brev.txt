@@ -1,0 +1,17 @@
+git clone git@github.com:vajpayeerajat/openpi.git && cd openpi && git checkout cosmos_2_8b_as_vision
+# same venv setup as local (uv venv ... uv pip install ...)
+export HF_HOME=/path/on/biggest/disk/hf_cache      # Cosmos-Reason2-8B is 17 GB
+~/venvs/openpi_cosmos/bin/hf auth login             # token needs WRITE access + Cosmos gated access
+
+# data -> ./train and ./val (7.3 GB), matching local_root="train"/"val" in the config
+~/venvs/openpi_cosmos/bin/hf download rajat-vajpayee/unitree_g1_data-830-episodes_split \
+    --repo-type dataset --local-dir .
+
+$PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name stage1_brev \
+    --batch-size 16 --num-workers 8 \
+    --val-interval 42 --save-interval 500 \
+    --checkpoint-base-dir ./checkpoints \
+    --hf-repo-id rajat-vajpayee/cosmos2_8b_g1_pickplace \
+    --overwrite
+
+# instance died? On a new one, same command with --resume instead of --overwrite

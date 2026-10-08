@@ -638,6 +638,18 @@ class TrainConfig:
     # Base directory for checkpoints.
     checkpoint_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm" ## Added by Rajat
     archive_base_dir: str = "/mnt/nas/rajat_ws/checkpoints/cosmos_as_vlm" ## Added by Rajat
+
+    # Hugging Face model repo to mirror checkpoints and TensorBoard logs to (PyTorch trainer only), e.g.
+    # "rajat-vajpayee/cosmos2_8b_g1_pickplace". Created as a private repo if missing. Files go under
+    # <config name>/<exp name>/{<step>,tensorboard}. For machines with little disk (e.g. Brev): uploads run in the
+    # background, local checkpoints beyond the newest `hf_keep_local` are deleted once uploaded, and --resume pulls
+    # the latest checkpoint from the repo when it is not on local disk.
+    hf_repo_id: str | None = None
+    # Number of newest checkpoints kept on local disk when hf_repo_id is set.
+    hf_keep_local: int = 1
+    # Also upload optimizer.pt (4.4 GiB for cosmos stage 1, vs 2.2 GiB for the weights). Needed to --resume from the
+    # repo; not needed to serve the policy.
+    hf_upload_optimizer: bool = True
     # checkpoint_dir: str = "./checkpoints/rajat"
     # Random seed that will be used by random generators during training.
     seed: int = 42

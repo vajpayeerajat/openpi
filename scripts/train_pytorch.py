@@ -31,6 +31,7 @@ import platform
 import shutil
 import time
 
+import huggingface_hub
 import jax
 import numpy as np
 import safetensors.torch
@@ -165,10 +166,10 @@ def load_model_weights(model, path, device="cpu"):
         safetensors.torch.load_model(model, path, device=str(device))
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config) -> bool:
+    """Save a checkpoint with model state, optimizer state, and metadata. Returns whether a checkpoint was saved."""
     if not is_main:
-        return
+        return False
 
     # Only save if it's time to save or if it's the final step
     if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
@@ -214,6 +215,8 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         # Log checkpoint to wandb
         if config.wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
+        return True
+    return False
 
 
 def load_checkpoint(model, optimizer, checkpoint_dir, device):
@@ -379,6 +382,103 @@ def log_eval(writer, split: str, metrics: dict[str, float], step: int, *, wandb_
         wandb.log({f"{split}/{k}": v for k, v in metrics.items()}, step=step)
 
 
+class HubSync:
+    """Mirrors checkpoints and TensorBoard logs to a Hugging Face model repo (`config.hf_repo_id`).
+
+    Uploads run in the background (huggingface_hub runs them one at a time, in order). Local checkpoints older than the
+    newest `config.hf_keep_local` are deleted only once their upload has finished, so a failed upload never loses data.
+    """
+
+    def __init__(self, config: _config.TrainConfig):
+        self.api = huggingface_hub.HfApi()
+        self.repo_id = config.hf_repo_id
+        self.prefix = f"{config.name}/{config.exp_name}"
+        self.checkpoint_dir = config.checkpoint_dir
+        self.keep_local = max(1, config.hf_keep_local)
+        self.ignore = None if config.hf_upload_optimizer else ["optimizer.pt"]
+        self._pending: dict[int, object] = {}  # step -> Future of its upload
+        self._tb_future = None
+        self.api.create_repo(self.repo_id, private=True, exist_ok=True)
+        logging.info(f"Mirroring checkpoints and TensorBoard to https://huggingface.co/{self.repo_id}/tree/main/{self.prefix}")
+
+    def _submit(self, step: int):
+        return self.api.upload_folder(
+            repo_id=self.repo_id,
+            folder_path=self.checkpoint_dir / str(step),
+            path_in_repo=f"{self.prefix}/{step}",
+            ignore_patterns=self.ignore,
+            commit_message=f"{self.prefix}: checkpoint {step}",
+            run_as_future=True,
+        )
+
+    def upload_checkpoint(self, step: int):
+        self._pending[step] = self._submit(step)
+        self._prune_local()
+
+    def upload_tensorboard(self, writer):
+        # Skip if the previous TensorBoard upload is still queued; the next call will pick up the new events.
+        if self._tb_future is not None and not self._tb_future.done():
+            return
+        writer.flush()
+        self._tb_future = self.api.upload_folder(
+            repo_id=self.repo_id,
+            folder_path=self.checkpoint_dir / "tensorboard",
+            path_in_repo=f"{self.prefix}/tensorboard",
+            commit_message=f"{self.prefix}: tensorboard",
+            run_as_future=True,
+        )
+
+    def _prune_local(self):
+        steps = sorted(int(d.name) for d in self.checkpoint_dir.iterdir() if d.is_dir() and d.name.isdigit())
+        for step in steps[: -self.keep_local]:
+            future = self._pending.get(step)
+            if future is None or not future.done():
+                continue  # not uploaded by this run, or still uploading
+            if (exc := future.exception()) is not None:
+                logging.error(f"Upload of checkpoint {step} to {self.repo_id} failed, retrying: {exc}")
+                self._pending[step] = self._submit(step)
+                continue
+            shutil.rmtree(self.checkpoint_dir / str(step))
+            del self._pending[step]
+            logging.info(f"Checkpoint {step} is on the Hub; deleted the local copy")
+
+    def finish(self, writer):
+        """Block until every upload is done (call at the end of training)."""
+        if writer is not None:
+            self.upload_tensorboard(writer)
+        for step, future in list(self._pending.items()):
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001
+                logging.error(f"Upload of checkpoint {step} failed, retrying once: {exc}")
+                self._submit(step).result()
+        if self._tb_future is not None:
+            self._tb_future.result()
+        logging.info(f"All uploads to {self.repo_id} finished")
+
+    @staticmethod
+    def download_latest(config: _config.TrainConfig) -> int | None:
+        """Download the newest resumable checkpoint (and the TensorBoard logs) of this run from the Hub."""
+        prefix = f"{config.name}/{config.exp_name}"
+        files = huggingface_hub.HfApi().list_repo_files(config.hf_repo_id)
+        steps = [
+            int(parts[2])
+            for f in files
+            if f.startswith(prefix + "/") and (parts := f.split("/"))[2].isdigit() and parts[-1] == "optimizer.pt"
+        ]
+        if not steps:
+            return None
+        step = max(steps)
+        logging.info(f"Downloading checkpoint {step} of {prefix} from {config.hf_repo_id}")
+        # Files land at <checkpoint_base_dir>/<config name>/<exp name>/..., i.e. exactly config.checkpoint_dir.
+        huggingface_hub.snapshot_download(
+            config.hf_repo_id,
+            allow_patterns=[f"{prefix}/{step}/*", f"{prefix}/tensorboard/*"],
+            local_dir=config.checkpoint_base_dir,
+        )
+        return step
+
+
 def get_latest_checkpoint_step(checkpoint_dir):
     """Get the latest checkpoint step number from a checkpoint directory."""
     checkpoint_steps = [
@@ -421,6 +521,13 @@ def train_loop(config: _config.TrainConfig):
 
     # Initialize checkpoint directory and wandb
     resuming = False
+    if config.resume and config.hf_repo_id is not None:
+        # On a fresh machine the checkpoints only exist on the Hub: fetch the latest one first.
+        has_local = config.checkpoint_dir.exists() and get_latest_checkpoint_step(config.checkpoint_dir) is not None
+        if is_main and not has_local:
+            HubSync.download_latest(config)
+        if use_ddp:
+            dist.barrier()
     if config.resume:
         # Find checkpoint directory based on experiment name
         exp_checkpoint_dir = config.checkpoint_dir
@@ -602,6 +709,7 @@ def train_loop(config: _config.TrainConfig):
         # purge_step drops events past the resume step left over from an interrupted run.
         writer = SummaryWriter(log_dir=str(tb_dir), purge_step=global_step if resuming else None)
         logging.info(f"TensorBoard logs: {tb_dir}")
+    hub_sync = HubSync(config) if (is_main and config.hf_repo_id is not None) else None
     metric_groups = get_action_metric_groups(config)
 
     val_iter = None
@@ -747,10 +855,13 @@ def train_loop(config: _config.TrainConfig):
                     val_batches = [next(val_iter) for _ in range(config.val_num_batches)]
                     val_metrics = evaluate_batches(model, val_batches, device, metric_groups)
                     log_eval(writer, "val", val_metrics, global_step, wandb_enabled=config.wandb_enabled)
+                if hub_sync is not None:
+                    hub_sync.upload_tensorboard(writer)
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            if save_checkpoint(model, optim, global_step, config, is_main, data_config) and hub_sync is not None:
+                hub_sync.upload_checkpoint(global_step)
 
             # Update progress bar
             if pbar is not None:
@@ -763,6 +874,8 @@ def train_loop(config: _config.TrainConfig):
     if pbar is not None:
         pbar.close()
 
+    if hub_sync is not None:
+        hub_sync.finish(writer)
     if writer is not None:
         writer.close()
 
