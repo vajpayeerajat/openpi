@@ -83,6 +83,22 @@ else
 fi
 HF="$VENV/bin/hf"
 
+# `hf download` with retries. Big repos (the dataset has 3.3k files) hit HF's per-5-minute rate limit (HTTP 429), so
+# use few parallel workers and wait out the window on failure. Files that finished are not downloaded again.
+HF_DOWNLOAD_WORKERS="${HF_DOWNLOAD_WORKERS:-2}"
+hf_download() {
+    local attempt wait
+    for attempt in 1 2 3 4 5 6 7 8; do
+        if "$HF" download "$@" --max-workers "$HF_DOWNLOAD_WORKERS" --quiet >/dev/null; then
+            return 0
+        fi
+        wait=$(( attempt * 60 < 300 ? attempt * 60 : 300 ))
+        log "Download failed (attempt $attempt/8; HTTP 429 means rate-limited). Retrying in ${wait}s, keeping finished files"
+        sleep "$wait"
+    done
+    die "Download of $1 kept failing. Re-run later, or try HF_DOWNLOAD_WORKERS=1 / HF_HUB_DISABLE_XET=1."
+}
+
 # ---------------------------------------------------------------------------------------------------------------------
 # 3. Hugging Face auth: HF_TOKEN from the environment, or an existing / interactive login.
 # ---------------------------------------------------------------------------------------------------------------------
@@ -108,14 +124,13 @@ print(f"checkpoint repo ready: https://huggingface.co/{repo_id}")
 EOF
 
 log "Downloading $VLM_REPO_ID into the HF cache (17 GB, skipped if cached)"
-"$HF" download "$VLM_REPO_ID" --quiet >/dev/null
+hf_download "$VLM_REPO_ID"
 
 # ---------------------------------------------------------------------------------------------------------------------
 # 4. Data: the config reads local_root="train" / "val" relative to the repo root.
 # ---------------------------------------------------------------------------------------------------------------------
 log "Downloading dataset $DATA_REPO_ID (7.3 GB, skipped if present)"
-"$HF" download "$DATA_REPO_ID" --repo-type dataset --include "train/*" "val/*" \
-    --local-dir "$WORK_DIR/data" --quiet >/dev/null
+hf_download "$DATA_REPO_ID" --repo-type dataset --include "train/*" "val/*" --local-dir "$WORK_DIR/data"
 for split in train val; do
     if [[ -L "$split" ]]; then
         ln -sfn "$WORK_DIR/data/$split" "$split"
