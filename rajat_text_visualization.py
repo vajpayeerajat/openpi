@@ -1,5 +1,5 @@
 """Attention visualization for the Cosmos-Reason2-8B (Qwen3-VL) pi05 policy -- PyTorch port of
-rajat_text_visualization.py (which targets the JAX PaliGemma model).
+vis_utils.py (which targets the JAX PaliGemma model).
 
 Two attention sources, both REAL softmax attention (mean over heads and the chosen layers), not the cosine-similarity
 proxy the PaliGemma script uses:
@@ -44,10 +44,10 @@ from openpi.models_pytorch.cosmos_pytorch import CosmosPi05Pytorch
 from openpi.models_pytorch.cosmos_pytorch import _apply_rope
 from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from openpi.training import config as _config
-from rajat_text_visualization import STOPWORDS
-from rajat_text_visualization import generate_and_save_vlm_attention
-from rajat_text_visualization import load_video_frames
-from rajat_text_visualization import save_text_query_attention
+from vis_utils import STOPWORDS
+from vis_utils import generate_and_save_vlm_attention
+from vis_utils import load_video_frames
+from vis_utils import save_text_query_attention
 
 NUM_CAMERAS = 3  # ego_view, left wrist, right wrist (order of the camera slots in the prefix)
 
@@ -404,8 +404,11 @@ def main():
         for gname, label in [("task", "prompt: task words"), ("state", "prompt: state"), ("other", "prompt: template")]:
             if groups[gname]:
                 exp_groups[label] = exp_full[:, text_start + np.asarray(groups[gname])].sum(1)
-        accounted = np.sum(np.stack(list(exp_groups.values())), axis=0)
-        exp_groups["special / sink tokens"] = np.clip(1.0 - accounted, 0.0, 1.0)
+        # <|vision_start|> / <|vision_end|> around each camera block (the first one is Qwen's attention sink)
+        special = np.concatenate([[c * (tpi + 2), c * (tpi + 2) + tpi + 1] for c in range(NUM_CAMERAS)])
+        exp_groups["vision start/end (sink)"] = exp_full[:, special].sum(1)
+        # exp_full only covers the prefix; the rest of each action token's attention goes to the action chunk itself
+        exp_groups["action tokens (self)"] = np.clip(1.0 - exp_full.sum(1), 0.0, 1.0)
         exp_sub = exp_full[:, keys_np]
         exp_sub = exp_sub / (exp_sub.sum(-1, keepdims=True) + 1e-12)
         exp_img, exp_txt = exp_sub[:, :tpi], exp_sub[:, tpi:]

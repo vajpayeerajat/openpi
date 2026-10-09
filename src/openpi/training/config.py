@@ -1267,35 +1267,50 @@ _CONFIGS = [
             train_llm_last_n_layers=1,
             vlm_lr_multiplier=0.1,    # 5e-6 on the pretrained VLM layers, 5e-5 on the from-scratch expert
         ),
-        data=LeRobotG1Dex3DataConfig(
-            repo_id="train",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="./assets/cosmos2_8b_g1_pickplace"),  # reuse stage-1 norm stats
+        data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="train",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+            ),
         ),
-        val_repo_id="val",
-        val_interval=300,
-        val_num_batches=30,
+        val_data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace_val",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="val",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+            ),
+            assets=AssetsConfig(asset_id="g1_pickplace"),
+        ),
+        val_interval=42,
+        val_num_batches=42,
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=800,
             peak_lr=2.5e-5,
-            decay_steps=1_000_000,
+            decay_steps=50_000,
             decay_lr=5e-5,  
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         wandb_enabled=False,
         num_train_steps=30_000,
-        batch_size=4,
+        batch_size=16,
         num_workers=2,
-        save_interval=2_500,
+        save_interval=1000,
         keep_period=2_500,
         log_interval=50,
         seed=0,
     ),
     # Stage 2 (optional): same, plus LoRA (rank 16) on every LLM linear layer and a trainable vision merger. Backprops
-    # through the 8B, so it is ~3x slower per step. Warm-start from stage 1 with
-    #   --pytorch-weight-path checkpoints/cosmos2_8b_g1_pickplace/<exp>/<step>
-    # It shares stage 1's norm stats (assets_dir below), so there is nothing to recompute.
+    # through the 8B, so it is ~3x slower per step. Warm-starts from stage 1 (pytorch_weight_path below); LoRA and the
+    # merger are not in that checkpoint and start from their pretrained values (LoRA B = 0, so step 0 == stage 1).
+    # It shares stage 1's norm stats, so there is nothing to recompute.
     TrainConfig(
         name="cosmos2_8b_lora_g1_pickplace",
         model=cosmos_config.CosmosPi05Config(
@@ -1307,30 +1322,47 @@ _CONFIGS = [
             train_vision_merger=True,
             llm_lora_rank=16,
             llm_lora_alpha=16.0,
+            vlm_lr_multiplier=2.0,    # 5e-5 peak on LoRA + merger, 2.5e-5 on the already-trained action expert
         ),
-        data=LeRobotG1Dex3DataConfig(
-            repo_id="train",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="./assets/cosmos2_8b_g1_pickplace"),
+        pytorch_weight_path="/home/shadeform/work/openpi/17500",
+        data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="train",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+            ),
         ),
-        val_repo_id="val",
-        val_interval=500,
-        val_num_batches=30,
+        val_data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace_val",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="val",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/cosmos2_8b_g1_pickplace/g1_pickplace/norm_stats.json",
+            ),
+            assets=AssetsConfig(asset_id="g1_pickplace"),
+        ),
+        val_interval=500,             # == save_interval, so every validated step has a checkpoint to pick
+        val_num_batches=42,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=2.5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,
+            warmup_steps=1000,         # fresh optimizer state; the expert is already trained, so a short warmup is enough
+            peak_lr=2.5e-5,           # what stage 1 actually ran at (its schedule stayed ~2.5e-5 the whole run)
+            decay_steps=24_000,       # == num_train_steps, so the cosine fully decays
+            decay_lr=2.5e-6,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         ema_decay=None,
         wandb_enabled=False,
-        num_train_steps=30_000,
-        batch_size=32,
-        num_workers=2,
-        save_interval=200,
-        keep_period=2_500,
-        log_interval=200,
+        num_train_steps=24_000,       # ~2.9 epochs at batch 32; stage 1 plateaued after ~2.1 epochs
+        batch_size=16,                # if it OOMs: 16, and double num_train_steps / decay_steps / warmup_steps
+        num_workers=8,
+        save_interval=500,
+        keep_period=2_500,            # not used by train_pytorch.py; every save_interval checkpoint is kept
+        log_interval=50,
         seed=0,
     ),
     # RoboArena & PolaRiS configs.
