@@ -48,6 +48,53 @@ class PaligemmaTokenizer:
         return np.asarray(tokens), np.asarray(mask)
 
 
+class CosmosTokenizer:
+    """Qwen3-VL tokenizer (used by Cosmos-Reason2) producing the same pi0/pi05 prompt formats as PaligemmaTokenizer.
+
+    Qwen splits numbers into single digits, so the pi05 discrete-state string costs roughly 3-4 tokens per state
+    dimension (vs ~2-3 for PaliGemma). Qwen has no BOS token; padding positions are filled with `pad_id` and masked.
+    """
+
+    def __init__(self, max_len: int = 200, tokenizer_path: str = "nvidia/Cosmos-Reason2-8B"):
+        self._max_len = max_len
+        self._tokenizer_path = tokenizer_path
+        # Loaded on first use, so building a data config (e.g. for compute_norm_stats, which never tokenizes) does not
+        # need access to the gated checkpoint.
+        self._tokenizer = None
+
+    def _load(self):
+        from transformers import AutoTokenizer
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_path)
+        self._pad_id = self._tokenizer.pad_token_id if self._tokenizer.pad_token_id is not None else 151643
+
+    def tokenize(self, prompt: str, state: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        if self._tokenizer is None:
+            self._load()
+        cleaned_text = prompt.strip().replace("_", " ").replace("\n", " ")
+        if state is not None:
+            discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            state_str = " ".join(map(str, discretized_state))
+            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+        else:
+            full_prompt = f"{cleaned_text}\n"
+        tokens = self._tokenizer.encode(full_prompt, add_special_tokens=False)
+        tokens_len = len(tokens)
+        if tokens_len < self._max_len:
+            mask = [True] * tokens_len + [False] * (self._max_len - tokens_len)
+            tokens = tokens + [self._pad_id] * (self._max_len - tokens_len)
+        else:
+            if tokens_len > self._max_len:
+                logging.warning(
+                    f"Token length ({tokens_len}) exceeds max length ({self._max_len}), truncating. "
+                    "Consider increasing the `max_token_len` in your model config if this happens frequently."
+                )
+            tokens = tokens[: self._max_len]
+            mask = [True] * self._max_len
+
+        return np.asarray(tokens), np.asarray(mask)
+
+
 class FASTTokenizer:
     def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
         self._max_len = max_len

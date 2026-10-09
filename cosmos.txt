@@ -1,0 +1,43 @@
+uv venv ~/venvs/openpi_cosmos --python 3.11
+source /home/rajatvajpayee/venvs/openpi_cosmos/bin/activate
+export VIRTUAL_ENV=~/venvs/openpi_cosmos UV_HTTP_TIMEOUT=900
+uv pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128 \
+    --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match
+printf "ml-dtypes==0.4.1\ntensorstore==0.1.74\ntransformers==4.57.1\ntorch==2.7.1\ntorchvision==0.22.1\ndatasets==3.6.0\ntorchcodec==0.5\n" > /tmp/ovr.txt
+uv pip install -e . -e packages/openpi-client --override /tmp/ovr.txt
+uv pip install tensorboard
+export HF_LEROBOT_HOME=/mnt/drive2/rajat_ws/lerobot_data
+PY=~/venvs/openpi_cosmos/bin/python
+
+# 1. One-time: request access at https://huggingface.co/nvidia/Cosmos-Reason2-8B, then
+~/venvs/openpi_cosmos/bin/hf auth login
+
+# 2. One-time: norm stats -> ./assets/cosmos2_8b_g1_pickplace/train  (~20 min on a 40k-frame random subset; the full set takes ~3 h)
+JAX_PLATFORMS=cpu $PY scripts/compute_norm_stats.py --config-name cosmos2_8b_g1_pickplace --max-frames 40000
+
+# 3. Stage 1: frozen 8B, train the action expert (~1.9 s/step -> ~16 h for 30k steps, 54 GB GPU)
+$ $PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name stage1 --batch_size 16 --val_interval 42 --save_interval 42  --overwrite
+#    Resume after an interruption: add --resume
+
+# 4. Optional stage 2: LoRA on the LLM, starting from stage 1 (~4.2 s/step)
+$PY scripts/train_pytorch.py cosmos2_8b_lora_g1_pickplace --exp-name run1 \
+    --pytorch-weight-path checkpoints/cosmos2_8b_g1_pickplace/run1/29999
+
+# 5. Serve
+$PY scripts/serve_policy.py --port 8017 policy:checkpoint \
+    --policy.config=cosmos2_8b_g1_pickplace --policy.dir=checkpoints/cosmos2_8b_g1_pickplace/run1/29999
+
+
+~/venvs/openpi_cosmos/bin/tensorboard --logdir /mnt/nas/rajat_ws/openpi-et-robotics-implementation/checkpoints/cosmos2_8b_g1_pickplace --port 6006 --bind_all
+
+
+cd /mnt/nas/rajat_ws/openpi-et-robotics-implementation
+export HF_LEROBOT_HOME=$HOME/scratch/openpi
+PY=~/venvs/openpi_cosmos/bin/python
+
+# Warm-start from your stage-1 run (recommended, once run1_cosmos has a checkpoint)
+$PY scripts/train_pytorch.py cosmos2_8b_last2_g1_pickplace --exp-name last2_run1 \
+    --pytorch-weight-path checkpoints/cosmos2_8b_g1_pickplace/run1_cosmos/<step>
+
+# Or from scratch, with 4 unfrozen layers instead of 2
+$PY scripts/train_pytorch.py cosmos2_8b_last2_g1_pickplace --exp-name last4_run1 --model.train-llm-last-n-layers 4
