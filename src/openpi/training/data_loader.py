@@ -127,6 +127,32 @@ class FakeDataset(Dataset):
         return self._num_samples
 
 
+# G1 upper-body action layout [L_arm 7, L_hand 7, R_arm 7, R_hand 7]; an episode whose right-hand command never moves
+# more than this is a non-demonstration (the same rule as rajat_gradcam_analysis.py).
+_RIGHT_HAND = slice(21, 28)
+_IDLE_HAND_RANGE = 0.05
+
+
+def find_idle_episodes(dataset_meta) -> list[int]:
+    """Episode indices whose right hand never grasps. Cached in <root>/meta/idle_episodes.json."""
+    import json
+
+    import pandas as pd
+
+    cache = dataset_meta.root / "meta" / "idle_episodes.json"
+    if cache.exists():
+        return json.loads(cache.read_text())["idle_episodes"]
+    idle = []
+    for ep in sorted(dataset_meta.episodes):
+        actions = np.stack(pd.read_parquet(dataset_meta.root / dataset_meta.get_data_file_path(ep), columns=["action"])["action"])
+        if actions.shape[-1] != 28:
+            raise ValueError(f"drop_idle_episodes expects 28-dim G1 actions, got {actions.shape[-1]}")
+        if np.ptp(actions[:, _RIGHT_HAND].mean(1)) < _IDLE_HAND_RANGE:
+            idle.append(int(ep))
+    cache.write_text(json.dumps({"rule": f"ptp(mean right-hand action) < {_IDLE_HAND_RANGE}", "idle_episodes": idle}))
+    return idle
+
+
 def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
@@ -156,9 +182,20 @@ def create_torch_dataset(
         **dataset_kwargs,
     )
 
+    ## Comment if you want to drop the idle episodes. for me, its an issue of data collection, so i will not handle this in the code. However, 
+    ## I have added the code, but i do not wish to use it. If we focus on data colleciton pipeline, we will not need it. 
+
+    # if data_config.drop_idle_episodes:
+    #     # A frame-level Subset of the full dataset: LeRobot's own `episodes=` argument mis-indexes non-prefix subsets.
+    #     idle = set(find_idle_episodes(dataset_meta))
+    #     starts, ends = dataset.episode_data_index["from"].tolist(), dataset.episode_data_index["to"].tolist()
+    #     keep = [i for ep, (s, e) in enumerate(zip(starts, ends, strict=True)) if ep not in idle for i in range(s, e)]
+    #     logging.info(f"drop_idle_episodes: {repo_id}: dropped {len(idle)}/{dataset_meta.total_episodes} episodes, "
+    #                  f"keeping {len(keep)}/{len(dataset)} frames")
+    #     dataset = torch.utils.data.Subset(dataset, keep)
+
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
-
     return dataset
 
 

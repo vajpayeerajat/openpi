@@ -8,7 +8,7 @@ to the config assets directory.
 import numpy as np
 import tqdm
 import tyro
-
+import os
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
@@ -50,7 +50,7 @@ def create_torch_dataloader(
     data_loader = _data_loader.TorchDataLoader(
         dataset,
         local_batch_size=batch_size,
-        num_workers=8,
+        num_workers=4,
         shuffle=shuffle,
         num_batches=num_batches,
     )
