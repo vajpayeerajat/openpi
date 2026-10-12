@@ -17,6 +17,13 @@ $PY scripts/train_pytorch.py cosmos2_8b_g1_pickplace --exp-name stage1_brev \
 # instance died? On a new one, same command with --resume instead of --overwrite
 
 
+## To resume training 
+
+shadeform@brev-r2rmtfez4:~/work/openpi$ export HF_HOME=/hf_cache
+shadeform@brev-r2rmtfez4:~/work/openpi$ RESUME=yes DATA_DIR=/lerobot_data bash scripts/brev_train.sh
+
+
+
 
 # 1. create the target dir
 ssh -i ~/.brev/brev.pem -p 22 shadeform@216.81.200.25 \

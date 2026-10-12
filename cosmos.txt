@@ -41,3 +41,7 @@ $PY scripts/train_pytorch.py cosmos2_8b_last2_g1_pickplace --exp-name last2_run1
 
 # Or from scratch, with 4 unfrozen layers instead of 2
 $PY scripts/train_pytorch.py cosmos2_8b_last2_g1_pickplace --exp-name last4_run1 --model.train-llm-last-n-layers 4
+
+
+
+

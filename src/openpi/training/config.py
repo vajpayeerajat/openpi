@@ -95,6 +95,10 @@ class DataConfig:
 
     local_root: str | None = None
 
+    # Skip G1 episodes where the right hand never grasps (empty table / a person handling the object while the robot
+    # idles, yet labelled "Pick up ..."). Detected from the parquet actions, cached in <root>/meta/idle_episodes.json.
+    drop_idle_episodes: bool = False
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -1148,41 +1152,67 @@ _CONFIGS = [
         name="pi05_g1_pickplace",
         model=pi0_config.Pi0Config(
             pi05=True,
-            action_dim=32,        # 28 real upper-body dims + 4 padding
-            action_horizon=50,    # 2.5 s at this dataset's 20 fps (NOT 1.67 s -- that assumed 30 fps)
-            # DO NOT set max_token_len=48. For pi05, `discrete_state_input` defaults to True and
-            # embed_suffix() skips the continuous state token entirely (`if not self.pi05`), so the
-            # ONLY path for proprioception is the discretised state string in the prompt:
-            #   "Task: <prompt>, State: <32 ints>;\nAction: "
-            # That is a measured 120-142 tokens for this task (median 132). At max_token_len=48 the
-            # tokenizer truncates after 9 of 32 values -- keeping the LEFT arm and dropping the
-            # entire right arm and hand -- and only emits a logging.warning. Leave it unset so the
-            # pi05 default of 200 applies.
+            action_dim=32,        # 28 real upper-body dims + 4 padding, matches pi05_base.
+            action_horizon=50,    # 2.5 s at this dataset's 20 fps.
+            # discrete_state_input stays at the pi05 default of True: with pi05=True the
+            # model never builds a continuous state token (see pi05_g1's comment above), so
+            # the discretised state string in the prompt is the only proprioception path.
+            # max_token_len is left unset (-> 200) so that string isn't truncated.
         ),
-        data=LeRobotG1Dex3DataConfig(
-            # Local dataset: set HF_LEROBOT_HOME to its parent, use the leaf name as repo_id.
-            repo_id="pick_and_place-300",
-            base_config=DataConfig(prompt_from_task=True),
+        data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="train",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/pi05_g1_pickplace/norm_stats.json",
+            ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "gs://openpi-assets/checkpoints/pi05_base/params"
+        val_data=LeRobotG1DataConfig(
+            repo_id="g1_pickplace_val",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                local_root="val",
+                video_backend="torchcodec",
+                asset_id="g1_pickplace",
+                norm_stats="./assets/pi05_g1_pickplace/norm_stats.json",
+            ),
+            # Reuse the train split's norm stats -- there's no separate norm_stats asset
+            # computed for val, and stats should come from the training distribution anyway.
+            assets=AssetsConfig(asset_id="g1_pickplace"),
         ),
-        # Matched to pi05_libero, which the runbook used as its template but did not copy from:
+        val_interval=166,
+        val_num_batches=42,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,      # libero uses 10_000, which is a third of a 30k run -- too long here
-            peak_lr=5e-5,
-            decay_steps=1_000_000,
-            decay_lr=5e-5,           # peak == decay -> effectively constant 5e-5 after warmup
+            # Warm up over ~1 epoch (166 steps) instead of 6 epochs
+            warmup_steps=166,
+            peak_lr=5e-5,       # Standard starting point for fine-tuning openpi/robotics tasks
+            decay_steps=20_000,   # Matches your total steps for a clean decay curve
+            decay_lr=1e-6,       # Let it decay to a minimum value to stabilize training at the end
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,             # pi05_libero sets this; the TrainConfig default is 0.99
-        wandb_enabled=False,         # no W&B account; every logged scalar also goes to stdout.
-                                    # Delete this line if you later create one (free tier is plenty).
-        num_train_steps=30_000,      # 6.6 epochs over 161,440 frames at batch 32
-        batch_size=32,
-        save_interval=2_500,
-        keep_period=2_500,
-        log_interval=200,
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        wandb_enabled=False,  # No W&B account -- TensorBoard (checkpoint_dir/tensorboard) is
+                              # the monitoring path here; every logged scalar also goes to stdout.
+        num_train_steps=20_000,
+        batch_size=4,
+        num_workers=2,
+        # Same OOM history as pi05_g1 on this host (62 GiB RAM): async + full train-state
+        # saves (params + Adam mu/nu + ema) OOM-killed that run at step 2500. Stream
+        # params-only checkpoints to disk instead -- trades away `--resume`.
+        async_checkpointing=False,
+        save_train_state=False,
+        # /mnt/drive2 has ~277 GiB free (checked 2026-09-27). Each save is ~12.5 GiB
+        # (save_train_state=False), so a rolling window of the 10 most recent checkpoints
+        # is ~125 GiB steady, ~137.5 GiB peak while rotating -- comfortably inside budget.
+        # No pinned checkpoints (keep_period=None): a plain rolling window of 10 is what's
+        # wanted here, not specific pinned steps.
+        save_interval=50,
+        keep_period=None,
+        max_to_keep=100,
+        log_interval=50,
         seed=0,
     ),
     # pi05 with Cosmos-Reason2-8B as the VLM (PyTorch only: scripts/train_pytorch.py), fine-tuned on the G1 cube-sorting
